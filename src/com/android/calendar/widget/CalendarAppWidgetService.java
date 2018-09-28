@@ -95,7 +95,7 @@ public class CalendarAppWidgetService extends RemoteViewsService {
             EVENT_PROJECTION[INDEX_COLOR] = Instances.CALENDAR_COLOR;
         }
     }
-    static final int MAX_DAYS = 7;
+    static final int MAX_DAYS = 28;
 
     private static final long SEARCH_DURATION = MAX_DAYS * DateUtils.DAY_IN_MILLIS;
 

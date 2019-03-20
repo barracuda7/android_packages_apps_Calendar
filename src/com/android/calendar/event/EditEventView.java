@@ -95,6 +95,8 @@ import com.android.timezonepicker.TimeZoneInfo;
 import com.android.timezonepicker.TimeZonePickerDialog;
 import com.android.timezonepicker.TimeZonePickerUtils;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Formatter;
@@ -570,7 +572,7 @@ public class EditEventView implements View.OnClickListener, DialogInterface.OnCa
         if (mModel == null || (mCalendarsCursor == null && mModel.mUri == null)) {
             return false;
         }
-        return fillModelFromUI();
+        return fillModelFromUI(true);
     }
 
     public boolean fillModelFromReadOnlyUi() {
@@ -612,7 +614,14 @@ public class EditEventView implements View.OnClickListener, DialogInterface.OnCa
             rpd = new RecurrencePickerDialog();
             rpd.setArguments(b);
             rpd.setOnRecurrenceSetListener(EditEventView.this);
-            rpd.show(fm, FRAG_TAG_RECUR_PICKER);
+            Class clazz = rpd.getClass();
+            try {
+                Method m = clazz.getMethod("showAllowingStateLoss",
+                        FragmentManager.class, String.class);
+                m.invoke(rpd, fm, FRAG_TAG_RECUR_PICKER);
+            } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
+                e.printStackTrace();
+            }
             return;
         }
 
@@ -667,7 +676,7 @@ public class EditEventView implements View.OnClickListener, DialogInterface.OnCa
     }
 
     // Goes through the UI elements and updates the model as necessary
-    private boolean fillModelFromUI() {
+    private boolean fillModelFromUI(boolean ignoreAllday) {
         if (mModel == null) {
             return false;
         }
@@ -716,7 +725,7 @@ public class EditEventView implements View.OnClickListener, DialogInterface.OnCa
             }
         }
 
-        if (mModel.mAllDay) {
+        if (mModel.mAllDay && !ignoreAllday) {
             // Reset start and end time, increment the monthDay by 1, and set
             // the timezone to UTC, as required for all-day events.
             mTimezone = Time.TIMEZONE_UTC;
@@ -730,6 +739,7 @@ public class EditEventView implements View.OnClickListener, DialogInterface.OnCa
             mEndTime.minute = 0;
             mEndTime.second = 0;
             mEndTime.timezone = mTimezone;
+            mModel.mEnd = mEndTime.normalize(true);
             // When a user see the event duration as "X - Y" (e.g. Oct. 28 - Oct. 29), end time
             // should be Y + 1 (Oct.30).
             final long normalizedEndTimeMillis =
@@ -1366,7 +1376,7 @@ public class EditEventView implements View.OnClickListener, DialogInterface.OnCa
 
         if (mSaveAfterQueryComplete) {
             mLoadingCalendarsDialog.cancel();
-            if (prepareForSave() && fillModelFromUI()) {
+            if (prepareForSave() && fillModelFromUI(false)) {
                 int exit = userVisible ? Utils.DONE_EXIT : 0;
                 mDone.setDoneCode(Utils.DONE_SAVE | exit);
                 mDone.run();

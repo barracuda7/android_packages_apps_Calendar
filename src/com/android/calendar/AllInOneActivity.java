@@ -29,10 +29,13 @@ import android.app.ActionBar.Tab;
 import android.app.Fragment;
 import android.app.FragmentManager;
 import android.app.FragmentTransaction;
+import android.app.LoaderManager;
 import android.content.AsyncQueryHandler;
 import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
 import android.content.ContentUris;
+import android.content.CursorLoader;
+import android.content.Loader;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.SharedPreferences.OnSharedPreferenceChangeListener;
@@ -43,6 +46,7 @@ import android.database.Cursor;
 import android.graphics.drawable.LayerDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.provider.CalendarContract;
 import android.provider.CalendarContract.Attendees;
@@ -57,6 +61,9 @@ import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.animation.AccelerateInterpolator;
+import android.view.animation.OvershootInterpolator;
+import android.widget.ImageButton;
 import android.widget.LinearLayout;
 import android.widget.RelativeLayout;
 import android.widget.RelativeLayout.LayoutParams;
@@ -71,7 +78,9 @@ import com.android.calendar.CalendarController.ViewType;
 import com.android.calendar.agenda.AgendaFragment;
 import com.android.calendar.month.MonthByWeekFragment;
 import com.android.calendar.selectcalendars.SelectVisibleCalendarsFragment;
+import com.android.calendar.year.YearViewPagerFragment;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.List;
 import java.util.Locale;
@@ -84,6 +93,7 @@ import static android.provider.CalendarContract.EXTRA_EVENT_END_TIME;
 
 public class AllInOneActivity extends AbstractCalendarActivity implements EventHandler,
         OnSharedPreferenceChangeListener, SearchView.OnQueryTextListener, ActionBar.TabListener,
+        LoaderManager.LoaderCallbacks<Cursor>,
         ActionBar.OnNavigationListener, OnSuggestionListener {
     private static final String TAG = "AllInOneActivity";
     private static final boolean DEBUG = false;
@@ -95,12 +105,13 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
     private static final int HANDLER_KEY = 0;
 
     // Indices of buttons for the drop down menu (tabs replacement)
-    // Must match the strings in the array buttons_list in arrays.xml and the
+    // Must match the strings in the array buttons_list_cm in cm_arrays.xml and the
     // OnNavigationListener
     private static final int BUTTON_DAY_INDEX = 0;
     private static final int BUTTON_WEEK_INDEX = 1;
     private static final int BUTTON_MONTH_INDEX = 2;
     private static final int BUTTON_AGENDA_INDEX = 3;
+    private static final int BUTTON_YEAR_INDEX = 4;
 
     private CalendarController mController;
     private static boolean mIsMultipane;
@@ -124,6 +135,11 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
     private View mCalendarsList;
     private View mMiniMonthContainer;
     private View mSecondaryPane;
+    private View mFab;
+    private int mFabHeight;
+    private int mFabYOffset;
+    private boolean mFabShowing = true;
+    private int mFabAnimDuration;
     private String mTimeZone;
     private boolean mShowCalendarControls;
     private boolean mShowEventInfoFullScreenAgenda;
@@ -144,6 +160,7 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
     private ActionBar.Tab mDayTab;
     private ActionBar.Tab mWeekTab;
     private ActionBar.Tab mMonthTab;
+    private ActionBar.Tab mYearTab;
     private ActionBar.Tab mAgendaTab;
     private SearchView mSearchView;
     private MenuItem mSearchMenu;
@@ -302,6 +319,9 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
 
     @Override
     protected void onCreate(Bundle icicle) {
+        if (RequestPermissionsActivity.startPermissionActivity(this)) {
+            finish();
+        }
         if (Utils.getSharedPreference(this, OtherPreferences.KEY_OTHER_1, false)) {
             setTheme(R.style.CalendarTheme_WithActionBarWallpaper);
         }
@@ -420,6 +440,12 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
         mMiniMonthContainer = findViewById(R.id.mini_month_container);
         mSecondaryPane = findViewById(R.id.secondary_pane);
 
+        mFab = (ImageButton) findViewById(R.id.floating_action_button);
+        mFabHeight = res.getDimensionPixelSize(R.dimen.floating_action_button_height);
+        mFabYOffset = res.getDimensionPixelSize(
+                R.dimen.floating_action_button_margin_bottom);
+        mFabAnimDuration = res.getInteger(R.integer.animation_duration_fast);
+
         // Must register as the first activity because this activity can modify
         // the list of event handlers in it's handle method. This affects who
         // the rest of the handlers the controller dispatches to are.
@@ -432,6 +458,12 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
         prefs.registerOnSharedPreferenceChangeListener(this);
 
         mContentResolver = getContentResolver();
+        if (getResources().getBoolean(R.bool.show_delete_events_menu)) {
+            getLoaderManager().initLoader(0, null, this);
+        }
+
+        // Clean up cached ics and vcs files - in case onDestroy() didn't run the last time
+        cleanupCachedEventFiles();
     }
 
     private long parseViewAction(final Intent intent) {
@@ -486,6 +518,9 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
                 break;
             case ViewType.MONTH:
                 mActionBar.setSelectedNavigationItem(BUTTON_MONTH_INDEX);
+                break;
+            case ViewType.YEAR:
+                mActionBar.setSelectedNavigationItem(BUTTON_YEAR_INDEX);
                 break;
             default:
                 mActionBar.setSelectedNavigationItem(BUTTON_DAY_INDEX);
@@ -556,6 +591,9 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
         invalidateOptionsMenu();
 
         mCalIntentReceiver = Utils.setTimeChangesReceiver(this, mTimeChangesUpdater);
+        if (getResources().getBoolean(R.bool.show_delete_events_menu)) {
+            getLoaderManager().initLoader(0, null, this);
+        }
     }
 
     @Override
@@ -616,6 +654,37 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
         mController.deregisterAllEventHandlers();
 
         CalendarController.removeInstance(this);
+
+        // Clean up cached ics and vcs files
+        cleanupCachedEventFiles();
+    }
+
+    /**
+     * Cleans up the temporarily generated ics and vcs files in the cache directory
+     * The files are of the format *.ics and *.vcs
+     */
+    private void cleanupCachedEventFiles() {
+        if (!isExternalStorageWritable()) return;
+        File cacheDir = getExternalCacheDir();
+        File[] files = cacheDir.listFiles();
+        if (files == null) return;
+        for (File file : files) {
+            String filename = file.getName();
+            if (filename.endsWith(".ics") || filename.endsWith(".vcs")) {
+                file.delete();
+            }
+        }
+    }
+
+    /**
+     * Checks if external storage is available for read and write
+     */
+    public boolean isExternalStorageWritable() {
+        String state = Environment.getExternalStorageState();
+        if (Environment.MEDIA_MOUNTED.equals(state)) {
+            return true;
+        }
+        return false;
     }
 
     private void initFragments(long timeMillis, int viewType, Bundle icicle) {
@@ -714,6 +783,9 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
             getMenuInflater().inflate(extensionMenuRes, menu);
         }
 
+        MenuItem item = menu.findItem(R.id.action_import);
+        item.setVisible(ImportActivity.hasThingsToImport());
+
         mSearchMenu = menu.findItem(R.id.action_search);
         mSearchView = (SearchView) mSearchMenu.getActionView();
         if (mSearchView != null) {
@@ -740,6 +812,13 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
             mControlsMenu.setTitle(mHideControls ? mShowString : mHideString);
         }
 
+        MenuItem deleteEventsMenu = menu.findItem(R.id.action_delete_events);
+        if (!getResources().getBoolean(R.bool.show_delete_events_menu)) {
+            deleteEventsMenu.setVisible(false);
+        } else {
+            getLoaderManager().initLoader(0, null, this);
+        }
+
         MenuItem menuItem = menu.findItem(R.id.action_today);
         if (Utils.isJellybeanOrLater()) {
             // replace the default top layer drawable of the today icon with a
@@ -750,6 +829,19 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
             menuItem.setIcon(R.drawable.ic_menu_today_no_date_holo_light);
         }
         return true;
+    }
+
+    public void createEvent(View v) {
+        Time t = new Time();
+        t.set(mController.getTime());
+        if (t.minute > 30) {
+            t.hour++;
+            t.minute = 0;
+        } else if (t.minute > 0 && t.minute < 30) {
+            t.minute = 30;
+        }
+        mController.sendEventRelatedEvent(
+                this, EventType.CREATE_EVENT, -1, t.toMillis(true), 0, 0, 0, -1);
     }
 
     @Override
@@ -766,18 +858,6 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
             t = new Time(mTimeZone);
             t.setToNow();
             extras |= CalendarController.EXTRA_GOTO_TODAY;
-        } else if (itemId == R.id.action_create_event) {
-            t = new Time();
-            t.set(mController.getTime());
-            if (t.minute > 30) {
-                t.hour++;
-                t.minute = 0;
-            } else if (t.minute > 0 && t.minute < 30) {
-                t.minute = 30;
-            }
-            mController.sendEventRelatedEvent(
-                    this, EventType.CREATE_EVENT, -1, t.toMillis(true), 0, 0, 0, -1);
-            return true;
         } else if (itemId == R.id.action_select_visible_calendars) {
             mController.sendEvent(this, EventType.LAUNCH_SELECT_VISIBLE_CALENDARS, null, null,
                     0, 0);
@@ -804,6 +884,11 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
             return true;
         } else if (itemId == R.id.action_search) {
             return false;
+        } else if (itemId == R.id.action_delete_events) {
+            startActivity(new Intent(this, DeleteEventsActivity.class));
+            return true;
+        } else if (itemId == R.id.action_import) {
+            ImportActivity.pickImportFile(this);
         } else {
             return mExtensions.handleItemSelected(item, this);
         }
@@ -914,6 +999,16 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
                 }
                 ExtensionsFactory.getAnalyticsLogger(getBaseContext()).trackView("month");
                 break;
+            case ViewType.YEAR:
+                if (mActionBar != null && (mActionBar.getSelectedTab() != mYearTab)) {
+                    mActionBar.selectTab(mYearTab);
+                }
+                if (mActionBarMenuSpinnerAdapter != null) {
+                    mActionBar.setSelectedNavigationItem(CalendarViewAdapter.YEAR_BUTTON_INDEX);
+                }
+                frag = new YearViewPagerFragment(timeMillis);
+                ExtensionsFactory.getAnalyticsLogger(getBaseContext()).trackView("year");
+                break;
             case ViewType.WEEK:
             default:
                 if (mActionBar != null && (mActionBar.getSelectedTab() != mWeekTab)) {
@@ -992,6 +1087,7 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
                 Log.d(TAG, "setMainPane AllInOne=" + this + " finishing:" + this.isFinishing());
             }
             ft.commit();
+            showFab();      // Reset FAB after every transaction; on every refresh of main_pane
         }
     }
 
@@ -1081,7 +1177,8 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
 
     @Override
     public long getSupportedEventTypes() {
-        return EventType.GO_TO | EventType.VIEW_EVENT | EventType.UPDATE_TITLE;
+        return EventType.GO_TO | EventType.VIEW_EVENT | EventType.UPDATE_TITLE |
+                EventType.HIDE_FAB | EventType.SHOW_FAB;
     }
 
     @Override
@@ -1215,8 +1312,34 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
             if (!mIsTabletConfig) {
                 mActionBarMenuSpinnerAdapter.setTime(mController.getTime());
             }
+        } else if (event.eventType == EventType.SHOW_FAB) {
+            showFab();
+        } else if (event.eventType == EventType.HIDE_FAB) {
+            hideFab();
         }
         updateSecondaryTitleFields(displayTime);
+    }
+
+    private void showFab() {
+        if (!mFabShowing) {
+            mFab.animate()
+                    .translationY(0)    // Move FAB to the originally specified location in layout
+                    .setDuration(mFabAnimDuration)
+                    .setInterpolator(new OvershootInterpolator());
+
+            mFabShowing = true;
+        }
+    }
+
+    private void hideFab() {
+        if (mFabShowing) {
+            mFab.animate()
+                    .translationY(mFabHeight + mFabYOffset) // FAB disappears off container bounds
+                    .setDuration(mFabAnimDuration)
+                    .setInterpolator(new AccelerateInterpolator());
+
+            mFabShowing = false;
+        }
     }
 
     // Needs to be in proguard whitelist
@@ -1254,13 +1377,15 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
             mController.sendEvent(this, EventType.GO_TO, null, null, -1, ViewType.WEEK);
         } else if (tab == mMonthTab && mCurrentView != ViewType.MONTH) {
             mController.sendEvent(this, EventType.GO_TO, null, null, -1, ViewType.MONTH);
+        } else if (tab == mYearTab && mCurrentView != ViewType.YEAR) {
+            mController.sendEvent(this, EventType.GO_TO, null, null, -1, ViewType.YEAR);
         } else if (tab == mAgendaTab && mCurrentView != ViewType.AGENDA) {
             mController.sendEvent(this, EventType.GO_TO, null, null, -1, ViewType.AGENDA);
         } else {
             Log.w(TAG, "TabSelected event from unknown tab: "
                     + (tab == null ? "null" : tab.getText()));
             Log.w(TAG, "CurrentView:" + mCurrentView + " Tab:" + tab.toString() + " Day:" + mDayTab
-                    + " Week:" + mWeekTab + " Month:" + mMonthTab + " Agenda:" + mAgendaTab);
+                    + " Week:" + mWeekTab + " Month:" + mMonthTab + " Year:" + mYearTab + " Agenda:" + mAgendaTab);
         }
     }
 
@@ -1291,6 +1416,11 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
                     mController.sendEvent(this, EventType.GO_TO, null, null, -1, ViewType.MONTH);
                 }
                 break;
+            case CalendarViewAdapter.YEAR_BUTTON_INDEX:
+                if (mCurrentView != ViewType.YEAR) {
+                    mController.sendEvent(this, EventType.GO_TO, null, null, -1, ViewType.YEAR);
+                }
+                break;
             case CalendarViewAdapter.AGENDA_BUTTON_INDEX:
                 if (mCurrentView != ViewType.AGENDA) {
                     mController.sendEvent(this, EventType.GO_TO, null, null, -1, ViewType.AGENDA);
@@ -1300,7 +1430,7 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
                 Log.w(TAG, "ItemSelected event from unknown button: " + itemPosition);
                 Log.w(TAG, "CurrentView:" + mCurrentView + " Button:" + itemPosition +
                         " Day:" + mDayTab + " Week:" + mWeekTab + " Month:" + mMonthTab +
-                        " Agenda:" + mAgendaTab);
+                        " Year:" + mYearTab + " Agenda:" + mAgendaTab);
                 break;
         }
         return false;
@@ -1323,5 +1453,41 @@ public class AllInOneActivity extends AbstractCalendarActivity implements EventH
             mSearchMenu.expandActionView();
         }
         return false;
+    }
+
+    @Override
+    public Loader<Cursor> onCreateLoader(int id, Bundle args) {
+        final String[] PROJECTION = new String[] {
+                CalendarContract.Events._ID,
+                CalendarContract.Events.TITLE,
+                CalendarContract.EventsEntity.DELETED
+        };
+        final String where = CalendarContract.EventsEntity.DELETED + "=0 AND "
+                + Calendars.CALENDAR_ACCESS_LEVEL + ">=" + Calendars.CAL_ACCESS_CONTRIBUTOR;
+        return new CursorLoader(this, CalendarContract.EventsEntity.CONTENT_URI,
+                PROJECTION, where, null, null);
+    }
+
+    @Override
+    public void onLoadFinished(Loader<Cursor> arg0, Cursor cursor) {
+        if (mOptionsMenu == null) {
+            Log.w(TAG, "mOptionsMenu is null");
+            return;
+        }
+
+        MenuItem delEventsMenu = mOptionsMenu.findItem(R.id.action_delete_events);
+        if (delEventsMenu != null) {
+            if (cursor == null || cursor.getCount() == 0) {
+                delEventsMenu.setEnabled(false);
+            } else {
+                delEventsMenu.setEnabled(true);
+            }
+        }
+    }
+
+    @Override
+    public void onLoaderReset(Loader<Cursor> arg0) {
+        // Do nothing
+        return;
     }
 }
